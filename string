@@ -1,0 +1,135 @@
+# gs1_parser.py – parser GS1 Brasil (corrige corte prematuro do lote)
+# ---------------------------------------------------------------------------
+# Ajuste principal
+# ----------------
+# No campo variável (10 ou 21) o algoritmo só deve encerrar o valor quando:
+#   • encontra um FNC1 **ou**
+#   • encontra um AI de comprimento FIXO **e** o trecho que vem depois dele
+#     forma um valor plausível para esse AI.
+# Dessa forma, o “17” que aparece dentro de “4F173A” **não** encerra o lote,
+# porque depois do 17 não há 6 dígitos numéricos válidos.
+# ---------------------------------------------------------------------------
+
+from __future__ import annotations
+
+import calendar
+from datetime import datetime
+from typing import Dict, Optional
+
+GS = "\x1d"  # ASCII 29 – mantido quando presente
+
+AI_FIXED   = {"01": 14, "17": 6, "713": 13}   # comprimento fixo
+AI_VAR_MAX = {"10": 20, "21": 20}             # máximo permitido
+ALL_AIS     = list(AI_FIXED.keys()) + list(AI_VAR_MAX.keys())
+
+# ---------------------------------------------------------------------------
+# 1. utilidades
+# ---------------------------------------------------------------------------
+
+def _yyMMdd_to_iso(v: str) -> Optional[str]:
+    if len(v) != 6 or not v.isdigit():
+        return None
+    yy, mm, dd = int(v[:2]), int(v[2:4]), int(v[4:])
+    if not 1 <= mm <= 12 or not 0 <= dd <= 31:
+        return None
+    yyyy = 2000 + yy if yy <= 49 else 1900 + yy
+    if dd == 0:
+        dd = calendar.monthrange(yyyy, mm)[1]
+    try:
+        datetime(yyyy, mm, dd)
+    except ValueError:
+        return None
+    return f"{yyyy:04d}-{mm:02d}-{dd:02d}"
+
+# ---------------------------------------------------------------------------
+# 2. limpeza e GTIN opcional
+# ---------------------------------------------------------------------------
+
+def _clean(raw: str) -> str:
+    return raw.replace("<GS>", GS)
+
+
+def _extract_gtin(s: str):
+    if not s.startswith("01"):
+        return None, s
+    val = s[2:16]
+    if len(val) == 14 and val.isdigit():
+        return val, s[16:]
+    raise ValueError("GTIN inválido – precisa de 14 dígitos numéricos")
+
+# ---------------------------------------------------------------------------
+# 3. busca de AI FIXO
+# ---------------------------------------------------------------------------
+
+def _find_fixed(ai: str, length: int, chunk: str, validator):
+    pos, n = 0, len(chunk)
+    while True:
+        idx = chunk.find(ai, pos)
+        if idx == -1 or idx + len(ai) + length > n:
+            return None
+        cand = chunk[idx + len(ai): idx + len(ai) + length]
+        if validator(cand):
+            return cand
+        pos = idx + 1
+
+# ---------------------------------------------------------------------------
+# 4. busca de AI VARIÁVEL (novo critério de parada)
+# ---------------------------------------------------------------------------
+
+def _find_var(ai: str, max_len: int, chunk: str, validator):
+    pos, n = 0, len(chunk)
+    while True:
+        idx = chunk.find(ai, pos)
+        if idx == -1 or idx + len(ai) >= n:
+            return None
+        start = idx + len(ai)
+        j = start
+        while j < n and j - start < max_len:
+            byte = chunk[j]
+            if byte == GS:
+                break
+            # só encerra se detectar AI FIXO válido à frente
+            for fixed_ai, flen in AI_FIXED.items():
+                if chunk.startswith(fixed_ai, j) and j + len(fixed_ai) + flen <= n:
+                    preview = chunk[j + len(fixed_ai): j + len(fixed_ai) + flen]
+                    validator_fixed = _yyMMdd_to_iso if fixed_ai == "17" else str.isdigit
+                    if validator_fixed(preview):
+                        break  # encerra por AI FIXO real
+            else:
+                j += 1
+                continue
+            break  # saiu do for → AI FIXO real encontrado
+
+        value = chunk[start:j]
+        if validator(value):
+            return value
+        pos = idx + 1
+
+# ---------------------------------------------------------------------------
+# 5. pipeline principal
+# ---------------------------------------------------------------------------
+
+def parse_gs1(raw: str) -> Dict[str, Optional[str]]:
+    s = _clean(raw)
+    gtin, rest = _extract_gtin(s)
+
+    expiration_raw = _find_fixed("17", 6, rest, _yyMMdd_to_iso)
+    expiration = _yyMMdd_to_iso(expiration_raw) if expiration_raw else None
+
+    anvisa = _find_fixed("713", 13, rest, str.isdigit)
+    lot = _find_var("10", 20, rest, lambda x: 1 <= len(x) <= 20)
+    serial = _find_var("21", 20, rest, lambda x: 1 <= len(x) <= 20)
+
+    return {
+        "gtin": gtin,
+        "lot": lot,
+        "serialNumber": serial,
+        "expirationDate": expiration,
+        "anvisaRegistration": anvisa,
+    }
+
+# ---------------------------------------------------------------------------
+# Execução
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    print(parse_gs1(input("String GS1 contínua: ").strip()))
